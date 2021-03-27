@@ -88,11 +88,9 @@ packages:
   flutter_bluetooth_basic:
     dependency: "direct main"
     description:
-      path: "."
-      ref: HEAD
-      resolved-ref: bb708141a54f675c41a581c1141fb7392187800c
-      url: "git://github.com/Kristijan505/flutter_bluetooth_basic.git"
-    source: git
+      name: flutter_bluetooth_basic
+      url: "https://pub.dartlang.org"
+    source: hosted
     version: "0.1.5"
   flutter_test:
     dependency: "direct dev"
