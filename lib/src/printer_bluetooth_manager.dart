@@ -51,8 +51,9 @@ class PrinterBluetoothManager {
       _scanResults.add(devices.map((d) => PrinterBluetooth(d)).toList());
     });
 
-    _isScanningSubscription =
-        _bluetoothManager.isScanning.listen((isScanningCurrent) async {
+    _isScanningSubscription = _bluetoothManager.isScanning.listen((
+      isScanningCurrent,
+    ) async {
       // If isScanning value changed (scan just stopped)
       if (_isScanning.value && !isScanningCurrent) {
         _scanResultsSubscription!.cancel();
@@ -113,10 +114,15 @@ class PrinterBluetoothManager {
               sleep(Duration(milliseconds: queueSleepTimeMs));
             }
 
-            completer.complete(PosPrintResult.success);
+            // Wait a bit longer for the printer to finish processing
+            sleep(Duration(milliseconds: 1000));
+
+            if (!completer.isCompleted) {
+              completer.complete(PosPrintResult.success);
+            }
           }
-          // TODO sending disconnect signal should be event-based
-          _runDelayed(3).then((dynamic v) async {
+          // Give 10 seconds for long receipts to complete before disconnecting
+          _runDelayed(10).then((dynamic v) async {
             await _bluetoothManager.disconnect();
             _isPrinting = false;
           });
@@ -132,7 +138,7 @@ class PrinterBluetoothManager {
 
     // Printing timeout
     _runDelayed(timeout).then((dynamic v) async {
-      if (_isPrinting) {
+      if (_isPrinting && !completer.isCompleted) {
         _isPrinting = false;
         completer.complete(PosPrintResult.timeout);
       }
@@ -143,8 +149,8 @@ class PrinterBluetoothManager {
 
   Future<PosPrintResult> printTicket(
     List<int> bytes, {
-    int chunkSizeBytes = 20,
-    int queueSleepTimeMs = 20,
+    int chunkSizeBytes = 256, // Optimal chunk size for most thermal printers
+    int queueSleepTimeMs = 50, // Balanced sleep time for reliable transmission
   }) async {
     if (bytes.isEmpty) {
       return Future<PosPrintResult>.value(PosPrintResult.ticketEmpty);
