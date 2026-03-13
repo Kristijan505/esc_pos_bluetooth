@@ -4,6 +4,18 @@
 
 The library allows to print receipts using a Bluetooth printer. For WiFi/Ethernet printers, use [esc_pos_printer](https://github.com/andrey-ushakov/esc_pos_printer) library.
 
+## Compatibility
+| Component | Version |
+| --- | --- |
+| Dart SDK | `>=3.11.0 <4.0.0` |
+| Flutter SDK | `>=3.41.0` |
+| `esc_pos_utils` | Pinned to `deee20c61573ca97bd5b041457832a4981b10cd0` |
+| `flutter_bluetooth_basic` | Pinned to `05e0127af523a1613403100103f3804ae0ea0783` |
+| Android plugin toolchain (`flutter_bluetooth_basic`) | `AGP 8.13.2`, `Gradle 8.13`, `compileSdk/targetSdk 36`, `minSdk 24`, build runtime `JDK 21` |
+| iOS deployment target (`flutter_bluetooth_basic`) | `13.0` |
+
+`flutter_bluetooth_basic` handles native Bluetooth integration. Ensure your host iOS app has the required Bluetooth usage descriptions in `Info.plist`.
+
 
 ## TODO (PRs are welcomed!)
 * Split byte data into chunks: [issue](https://github.com/andrey-ushakov/esc_pos_bluetooth/issues/5)
