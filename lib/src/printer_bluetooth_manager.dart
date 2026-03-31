@@ -398,6 +398,7 @@ class PrinterBluetoothManager {
   }) async {
     final completer = Completer<void>();
     StreamSubscription<int?>? subscription;
+    var isFirstEvent = true;
 
     subscription = _backend.state.listen(
       (state) {
@@ -413,6 +414,12 @@ class PrinterBluetoothManager {
             unawaited(subscription.cancel());
           }
         } else if (state == BluetoothManager.DISCONNECTED) {
+          // Preskoči inicijalni DISCONNECTED -- native strana još nije
+          // stigla obraditi connect zahtjev pa javlja staro stanje.
+          if (isFirstEvent) {
+            isFirstEvent = false;
+            return;
+          }
           if (!completer.isCompleted) {
             completer.completeError(_PrinterJobFailure(failureResult));
           }
@@ -420,6 +427,8 @@ class PrinterBluetoothManager {
             unawaited(subscription.cancel());
           }
         }
+
+        isFirstEvent = false;
       },
       onError: (Object error, StackTrace stackTrace) {
         if (!completer.isCompleted) {
