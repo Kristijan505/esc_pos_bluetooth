@@ -97,12 +97,12 @@ class PrinterBluetoothManager {
             BluetoothManagerBackend(BluetoothManager.instance);
 
   final PrinterBluetoothBackend _backend;
-  final Duration _connectTimeout = const Duration(seconds: 12);
+
   final List<Duration> _retryBackoffs = const <Duration>[
     Duration(milliseconds: 500),
     Duration(milliseconds: 1500),
   ];
-  final Duration _postSendSettleDelay = const Duration(seconds: 1);
+  final Duration _postSendSettleDelay = const Duration(seconds: 2);
 
   final BehaviorSubject<bool> _isScanning = BehaviorSubject.seeded(false);
   Stream<bool> get isScanningStream => _isScanning.stream;
@@ -296,154 +296,45 @@ class PrinterBluetoothManager {
 
   Future<PosPrintResult> _runPrintJob(_QueuedPrintJob job) async {
     await _stopScanInternal();
+
+    // Connect once, send the full payload once.
+    // The native layer (Android) already handles chunk sizing, retries,
+    // and reconnection internally.  Dart-level chunk/retry loops caused
+    // stale ACL_DISCONNECTED broadcasts to race against reconnects.
     for (var attempt = 0; attempt < 3; attempt++) {
       if (attempt > 0) {
         await Future<void>.delayed(_retryBackoffs[attempt - 1]);
       }
 
       try {
-        final result = await _runSingleAttempt(job);
-        if (result == PosPrintResult.success) {
-          return result;
+        await _connectAndAwait(job.printer);
+        await _backend.writeData(job.bytes);
+
+        if (_postSendSettleDelay.inMilliseconds > 0) {
+          await Future<void>.delayed(_postSendSettleDelay);
         }
+
+        return PosPrintResult.success;
       } on _PrinterJobFailure catch (failure) {
         if (failure.result != PosPrintResult.timeout) {
           return failure.result;
         }
       } catch (_) {
         // Swallow and retry below.
+      } finally {
+        await _safeDisconnect();
       }
     }
 
     return PosPrintResult.timeout;
   }
 
-  Future<PosPrintResult> _runSingleAttempt(_QueuedPrintJob job) async {
-    final chunkSizes = _chunkSizes(job.chunkSizeBytes);
-    _PrinterJobFailure? lastFailure;
-
-    for (final chunkSize in chunkSizes) {
-      try {
-        await _connectAndAwait(job.printer);
-        await _sendWithChunkSize(job.bytes, chunkSize, job.queueSleepTimeMs);
-        return PosPrintResult.success;
-      } on _PrinterJobFailure catch (failure) {
-        lastFailure = failure;
-      } catch (_) {
-        lastFailure = const _PrinterJobFailure(PosPrintResult.timeout);
-      } finally {
-        await _safeDisconnect();
-      }
-    }
-
-    throw lastFailure ?? const _PrinterJobFailure(PosPrintResult.timeout);
-  }
-
-  List<int> _chunkSizes(int preferredChunkSize) {
-    final ordered = <int>[
-      if (preferredChunkSize > 0) preferredChunkSize,
-      128,
-      64,
-    ];
-
-    final unique = <int>[];
-    for (final size in ordered) {
-      if (!unique.contains(size)) {
-        unique.add(size);
-      }
-    }
-    return unique;
-  }
-
   Future<void> _connectAndAwait(PrinterBluetooth printer) async {
+    // Native connect() is blocking on both platforms:
+    //  - Android: socket.connect() blocks until RFCOMM is up
+    //  - iOS: CoreBluetooth connect waits for didConnect + service discovery
+    // No need to poll the state stream afterwards.
     await _backend.connect(printer._device);
-    await _waitForState(
-      (state) => state == BluetoothManager.CONNECTED,
-      timeout: _connectTimeout,
-      failureResult: PosPrintResult.timeout,
-    );
-  }
-
-  Future<void> _sendWithChunkSize(
-    List<int> bytes,
-    int chunkSizeBytes,
-    int queueSleepTimeMs,
-  ) async {
-    final chunks = <List<int>>[];
-    final effectiveChunkSize = chunkSizeBytes <= 0 ? 1 : chunkSizeBytes;
-    for (var index = 0; index < bytes.length; index += effectiveChunkSize) {
-      final end =
-          (index + effectiveChunkSize < bytes.length)
-              ? index + effectiveChunkSize
-              : bytes.length;
-      chunks.add(bytes.sublist(index, end));
-    }
-
-    for (final chunk in chunks) {
-      await _backend.writeData(chunk);
-      if (queueSleepTimeMs > 0) {
-        await Future<void>.delayed(Duration(milliseconds: queueSleepTimeMs));
-      }
-    }
-
-    if (_postSendSettleDelay.inMilliseconds > 0) {
-      await Future<void>.delayed(_postSendSettleDelay);
-    }
-  }
-
-  Future<void> _waitForState(
-    bool Function(int? state) predicate, {
-    required Duration timeout,
-    required PosPrintResult failureResult,
-  }) async {
-    final completer = Completer<void>();
-    StreamSubscription<int?>? subscription;
-    var isFirstEvent = true;
-
-    subscription = _backend.state.listen(
-      (state) {
-        if (state == null) {
-          return;
-        }
-
-        if (predicate(state)) {
-          if (!completer.isCompleted) {
-            completer.complete();
-          }
-          if (subscription != null) {
-            unawaited(subscription.cancel());
-          }
-        } else if (state == BluetoothManager.DISCONNECTED) {
-          // Preskoči inicijalni DISCONNECTED -- native strana još nije
-          // stigla obraditi connect zahtjev pa javlja staro stanje.
-          if (isFirstEvent) {
-            isFirstEvent = false;
-            return;
-          }
-          if (!completer.isCompleted) {
-            completer.completeError(_PrinterJobFailure(failureResult));
-          }
-          if (subscription != null) {
-            unawaited(subscription.cancel());
-          }
-        }
-
-        isFirstEvent = false;
-      },
-      onError: (Object error, StackTrace stackTrace) {
-        if (!completer.isCompleted) {
-          completer.completeError(error, stackTrace);
-        }
-      },
-    );
-
-    try {
-      await completer.future.timeout(timeout);
-    } on TimeoutException {
-      throw _PrinterJobFailure(failureResult);
-    } finally {
-      await subscription.cancel();
-    }
   }
 
   Future<void> _safeDisconnect() async {
