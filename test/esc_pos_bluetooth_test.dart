@@ -173,8 +173,12 @@ void main() {
     );
   });
 
-  test('printTicket falls back to smaller chunks when a write fails', () async {
-    final backend = FakePrinterBluetoothBackend(failWritesOnChunkSizes: <int>{256});
+  // Dart-level chunk fallback was removed on purpose (see "Simplify BT print:
+  // remove _waitForState, send full payload at once"): the native layer already
+  // does chunk sizing and reconnection, and the Dart loop raced against stale
+  // ACL_DISCONNECTED broadcasts. A failing write now retries the WHOLE job.
+  test('printTicket resends the full payload instead of splitting it', () async {
+    final backend = FakePrinterBluetoothBackend(failWritesOnChunkSizes: <int>{300});
     final manager = PrinterBluetoothManager(backend: backend);
     manager.selectPrinter(PrinterBluetooth(_device('AA:11', 'Printer 1')));
 
@@ -185,13 +189,21 @@ void main() {
 
     final result = await manager.printTicket(List<int>.filled(300, 7));
 
-    expect(result, PosPrintResult.success);
-    expect(backend.connectCount, 2);
-    expect(backend.writeSizes, <int>[256, 128, 128, 44]);
+    expect(result, PosPrintResult.timeout);
+    expect(
+      backend.writeSizes,
+      <int>[300, 300, 300],
+      reason: 'full payload each time, never split into smaller chunks',
+    );
+    expect(
+      backend.connectCount,
+      3,
+      reason: 'three attempts, each with its own connect',
+    );
   });
 
-  test('printTicket retries the full job with backoff after repeated failures', () async {
-    final backend = FakePrinterBluetoothBackend(failWritesUntilConnectCount: 3);
+  test('printTicket retries the full job with backoff and succeeds on the third attempt', () async {
+    final backend = FakePrinterBluetoothBackend(failWritesUntilConnectCount: 2);
     final manager = PrinterBluetoothManager(backend: backend);
     manager.selectPrinter(PrinterBluetooth(_device('AA:11', 'Printer 1')));
 
@@ -205,7 +217,11 @@ void main() {
     stopwatch.stop();
 
     expect(result, PosPrintResult.success);
-    expect(backend.connectCount, 4);
-    expect(stopwatch.elapsedMilliseconds, greaterThanOrEqualTo(500));
+    expect(backend.connectCount, 3, reason: 'three attempts is the cap');
+    expect(
+      stopwatch.elapsedMilliseconds,
+      greaterThanOrEqualTo(2000),
+      reason: 'backoffs of 500 ms and 1500 ms between the three attempts',
+    );
   });
 }

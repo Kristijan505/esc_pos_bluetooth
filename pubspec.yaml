@@ -15,11 +15,11 @@ dependencies:
   esc_pos_utils:
     git:
       url: https://github.com/Kristijan505/esc_pos_utils.git
-      ref: deee20c61573ca97bd5b041457832a4981b10cd0
+      ref: 8d88b2e6caf7f20e355f6b96d7058ca171b025e9
   flutter_bluetooth_basic:
     git:
       url: https://github.com/Kristijan505/flutter_bluetooth_basic.git
-      ref: 772dbce7e63c76973b97fa36e132e1bb1386aa9a
+      ref: fe8dfe8a69fb4b0631b1c1ef0526da3ce8d199e5
 
 dev_dependencies:
   flutter_test:
