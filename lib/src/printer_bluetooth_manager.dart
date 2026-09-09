@@ -9,6 +9,7 @@
 import 'dart:async';
 import 'dart:collection';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter_bluetooth_basic/flutter_bluetooth_basic.dart';
 import 'package:rxdart/rxdart.dart';
 
@@ -109,6 +110,17 @@ class PrinterBluetoothManager {
   final List<_QueuedPrintJob> _pendingJobs = <_QueuedPrintJob>[];
   bool _isProcessingJobs = false;
   PrinterBluetooth? _selectedPrinter;
+
+  /// The raw error from the most recent print job, or `null` after a job
+  /// that never failed (or hasn't run yet).
+  ///
+  /// `printTicket`/`writeBytes` return a `PosPrintResult`, not the
+  /// exception itself, so this is the only place callers (and us, when
+  /// debugging) can see WHY a job failed - `device_disconnected` vs.
+  /// `job_timeout` from the native side matters when tracking down a
+  /// printer issue. Cleared at the start of every job, set right before a
+  /// failed job's result is returned.
+  String? lastError;
 
   void startScan(Duration timeout) {
     unawaited(_restartScan(timeout));
@@ -296,6 +308,8 @@ class PrinterBluetoothManager {
   Future<PosPrintResult> _runPrintJob(_QueuedPrintJob job) async {
     await _stopScanInternal();
 
+    lastError = null;
+
     // Connect once, send the full payload once, and stop there.
     //
     // The retry loop that stood here re-sent the ticket from its first byte,
@@ -303,6 +317,13 @@ class PrinterBluetoothManager {
     // so a broken connection produced a receipt with a repeated section
     // instead of a clean failure.  A failed job now surfaces to the caller,
     // and the user decides whether to print again.
+    //
+    // The failure surfaces as a returned PosPrintResult, never a thrown
+    // exception: printTicket/writeBytes are a documented contract used by
+    // callers outside this repo (RedCodeCMS, the sports museum CMS) that
+    // do `final res = await printTicket(...)` without a try/catch. Throwing
+    // here would turn a broken Bluetooth link into an uncaught async error
+    // for them.
     try {
       await _connectAndAwait(job.printer);
       await _backend.writeData(job.bytes);
@@ -312,6 +333,14 @@ class PrinterBluetoothManager {
       }
 
       return PosPrintResult.success;
+    } catch (error) {
+      lastError = error.toString();
+
+      if (kDebugMode) {
+        debugPrint('esc_pos_bluetooth: print job failed: $lastError');
+      }
+
+      return PosPrintResult.timeout;
     } finally {
       await _safeDisconnect();
     }

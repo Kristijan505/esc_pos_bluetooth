@@ -194,10 +194,20 @@ void main() {
       await backend.dispose();
     });
 
-    await expectLater(
-      manager.printTicket(List<int>.filled(300, 7)),
-      throwsA(isA<Exception>()),
-      reason: 'a failed write is reported, not swallowed by a retry',
+    final result = await manager.printTicket(List<int>.filled(300, 7));
+
+    expect(
+      result,
+      PosPrintResult.timeout,
+      reason:
+          'a failed write is reported as a returned result, not thrown - '
+          'printTicket/writeBytes is a documented contract for callers '
+          'without a try/catch',
+    );
+    expect(
+      manager.lastError,
+      contains('forced write failure'),
+      reason: 'the raw error stays inspectable for diagnostics',
     );
 
     expect(backend.writeSizes, <int>[
@@ -224,12 +234,11 @@ void main() {
     });
 
     final stopwatch = Stopwatch()..start();
-    await expectLater(
-      manager.printTicket(List<int>.filled(1, 9)),
-      throwsA(isA<Exception>()),
-    );
+    final result = await manager.printTicket(List<int>.filled(1, 9));
     stopwatch.stop();
 
+    expect(result, PosPrintResult.timeout);
+    expect(manager.lastError, contains('forced write failure'));
     expect(backend.connectCount, 1, reason: 'no second attempt');
     expect(backend.writeCount, 1);
     expect(
@@ -249,11 +258,14 @@ void main() {
       await backend.dispose();
     });
 
-    await expectLater(
-      manager.printTicket(List<int>.filled(4, 1)),
-      throwsA(isA<Exception>()),
-      reason: 'a failed connect is reported to the caller',
+    final result = await manager.printTicket(List<int>.filled(4, 1));
+
+    expect(
+      result,
+      PosPrintResult.timeout,
+      reason: 'a failed connect is reported as a returned result to the caller',
     );
+    expect(manager.lastError, contains('forced connect failure'));
 
     expect(
       backend.writeCount,
