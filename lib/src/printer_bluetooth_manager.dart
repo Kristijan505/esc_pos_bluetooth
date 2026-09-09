@@ -9,6 +9,7 @@
 import 'dart:async';
 import 'dart:collection';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter_bluetooth_basic/flutter_bluetooth_basic.dart';
 import 'package:rxdart/rxdart.dart';
 
@@ -84,24 +85,13 @@ class _QueuedPrintJob {
   final Completer<PosPrintResult> completer = Completer<PosPrintResult>();
 }
 
-class _PrinterJobFailure implements Exception {
-  const _PrinterJobFailure(this.result);
-
-  final PosPrintResult result;
-}
-
 /// Printer Bluetooth Manager
 class PrinterBluetoothManager {
   PrinterBluetoothManager({PrinterBluetoothBackend? backend})
-      : _backend = backend ??
-            BluetoothManagerBackend(BluetoothManager.instance);
+    : _backend = backend ?? BluetoothManagerBackend(BluetoothManager.instance);
 
   final PrinterBluetoothBackend _backend;
 
-  final List<Duration> _retryBackoffs = const <Duration>[
-    Duration(milliseconds: 500),
-    Duration(milliseconds: 1500),
-  ];
   final Duration _postSendSettleDelay = const Duration(seconds: 2);
 
   final BehaviorSubject<bool> _isScanning = BehaviorSubject.seeded(false);
@@ -121,6 +111,17 @@ class PrinterBluetoothManager {
   bool _isProcessingJobs = false;
   PrinterBluetooth? _selectedPrinter;
 
+  /// The raw error from the most recent print job, or `null` after a job
+  /// that never failed (or hasn't run yet).
+  ///
+  /// `printTicket`/`writeBytes` return a `PosPrintResult`, not the
+  /// exception itself, so this is the only place callers (and us, when
+  /// debugging) can see WHY a job failed - `device_disconnected` vs.
+  /// `job_timeout` from the native side matters when tracking down a
+  /// printer issue. Cleared at the start of every job, set right before a
+  /// failed job's result is returned.
+  String? lastError;
+
   void startScan(Duration timeout) {
     unawaited(_restartScan(timeout));
   }
@@ -133,6 +134,12 @@ class PrinterBluetoothManager {
     _selectedPrinter = printer;
   }
 
+  // `chunkSizeBytes` and `queueSleepTimeMs` are no longer read: the native
+  // layer now owns chunking and pacing (Android sends fixed 128-byte chunks
+  // with a 50ms pause between them; see flutter_bluetooth_basic's
+  // writeData/sendInChunks). The parameters are kept only so existing
+  // callers outside this repo (e.g. RedCodeCMS, Croatian sports museum CMS,
+  // both pinned to `ref: master` of this fork) keep compiling unchanged.
   Future<PosPrintResult> writeBytes(
     List<int> bytes, {
     int chunkSizeBytes = 20,
@@ -145,6 +152,10 @@ class PrinterBluetoothManager {
     );
   }
 
+  // See the note on `writeBytes` above: `chunkSizeBytes` and
+  // `queueSleepTimeMs` are ignored today (native layer chunks/paces
+  // writes) and are kept only for backwards compatibility with existing
+  // callers.
   Future<PosPrintResult> printTicket(
     List<int> bytes, {
     int chunkSizeBytes = 256, // Optimal chunk size for most thermal printers
@@ -297,36 +308,42 @@ class PrinterBluetoothManager {
   Future<PosPrintResult> _runPrintJob(_QueuedPrintJob job) async {
     await _stopScanInternal();
 
-    // Connect once, send the full payload once.
-    // The native layer (Android) already handles chunk sizing, retries,
-    // and reconnection internally.  Dart-level chunk/retry loops caused
-    // stale ACL_DISCONNECTED broadcasts to race against reconnects.
-    for (var attempt = 0; attempt < 3; attempt++) {
-      if (attempt > 0) {
-        await Future<void>.delayed(_retryBackoffs[attempt - 1]);
+    lastError = null;
+
+    // Connect once, send the full payload once, and stop there.
+    //
+    // The retry loop that stood here re-sent the ticket from its first byte,
+    // but the printer had already put the beginning of the receipt on paper —
+    // so a broken connection produced a receipt with a repeated section
+    // instead of a clean failure.  A failed job now surfaces to the caller,
+    // and the user decides whether to print again.
+    //
+    // The failure surfaces as a returned PosPrintResult, never a thrown
+    // exception: printTicket/writeBytes are a documented contract used by
+    // callers outside this repo (RedCodeCMS, the sports museum CMS) that
+    // do `final res = await printTicket(...)` without a try/catch. Throwing
+    // here would turn a broken Bluetooth link into an uncaught async error
+    // for them.
+    try {
+      await _connectAndAwait(job.printer);
+      await _backend.writeData(job.bytes);
+
+      if (_postSendSettleDelay.inMilliseconds > 0) {
+        await Future<void>.delayed(_postSendSettleDelay);
       }
 
-      try {
-        await _connectAndAwait(job.printer);
-        await _backend.writeData(job.bytes);
+      return PosPrintResult.success;
+    } catch (error) {
+      lastError = error.toString();
 
-        if (_postSendSettleDelay.inMilliseconds > 0) {
-          await Future<void>.delayed(_postSendSettleDelay);
-        }
-
-        return PosPrintResult.success;
-      } on _PrinterJobFailure catch (failure) {
-        if (failure.result != PosPrintResult.timeout) {
-          return failure.result;
-        }
-      } catch (_) {
-        // Swallow and retry below.
-      } finally {
-        await _safeDisconnect();
+      if (kDebugMode) {
+        debugPrint('esc_pos_bluetooth: print job failed: $lastError');
       }
+
+      return PosPrintResult.timeout;
+    } finally {
+      await _safeDisconnect();
     }
-
-    return PosPrintResult.timeout;
   }
 
   Future<void> _connectAndAwait(PrinterBluetooth printer) async {
