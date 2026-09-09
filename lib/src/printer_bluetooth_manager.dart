@@ -84,12 +84,6 @@ class _QueuedPrintJob {
   final Completer<PosPrintResult> completer = Completer<PosPrintResult>();
 }
 
-class _PrinterJobFailure implements Exception {
-  const _PrinterJobFailure(this.result);
-
-  final PosPrintResult result;
-}
-
 /// Printer Bluetooth Manager
 class PrinterBluetoothManager {
   PrinterBluetoothManager({PrinterBluetoothBackend? backend})
@@ -128,6 +122,12 @@ class PrinterBluetoothManager {
     _selectedPrinter = printer;
   }
 
+  // `chunkSizeBytes` and `queueSleepTimeMs` are no longer read: the native
+  // layer now owns chunking and pacing (Android sends fixed 128-byte chunks
+  // with a 50ms pause between them; see flutter_bluetooth_basic's
+  // writeData/sendInChunks). The parameters are kept only so existing
+  // callers outside this repo (e.g. RedCodeCMS, Croatian sports museum CMS,
+  // both pinned to `ref: master` of this fork) keep compiling unchanged.
   Future<PosPrintResult> writeBytes(
     List<int> bytes, {
     int chunkSizeBytes = 20,
@@ -140,6 +140,10 @@ class PrinterBluetoothManager {
     );
   }
 
+  // See the note on `writeBytes` above: `chunkSizeBytes` and
+  // `queueSleepTimeMs` are ignored today (native layer chunks/paces
+  // writes) and are kept only for backwards compatibility with existing
+  // callers.
   Future<PosPrintResult> printTicket(
     List<int> bytes, {
     int chunkSizeBytes = 256, // Optimal chunk size for most thermal printers
@@ -308,8 +312,6 @@ class PrinterBluetoothManager {
       }
 
       return PosPrintResult.success;
-    } on _PrinterJobFailure catch (failure) {
-      return failure.result;
     } finally {
       await _safeDisconnect();
     }

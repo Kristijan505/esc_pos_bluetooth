@@ -10,6 +10,7 @@ class FakePrinterBluetoothBackend implements PrinterBluetoothBackend {
   FakePrinterBluetoothBackend({
     this.failWritesOnChunkSizes = const <int>{},
     this.failWritesUntilConnectCount = 0,
+    this.failConnect = false,
     this.writeGate,
   });
 
@@ -22,6 +23,7 @@ class FakePrinterBluetoothBackend implements PrinterBluetoothBackend {
 
   final Set<int> failWritesOnChunkSizes;
   final int failWritesUntilConnectCount;
+  final bool failConnect;
   final Completer<void>? writeGate;
 
   final List<String> log = <String>[];
@@ -47,6 +49,11 @@ class FakePrinterBluetoothBackend implements PrinterBluetoothBackend {
   Future<void> connect(BluetoothDevice device) async {
     connectCount++;
     log.add('connect:${device.address}');
+
+    if (failConnect) {
+      throw Exception('forced connect failure for connect-failure test');
+    }
+
     _state.add(BluetoothManager.CONNECTED);
   }
 
@@ -229,6 +236,34 @@ void main() {
       stopwatch.elapsedMilliseconds,
       lessThan(2000),
       reason: 'no backoff waits, because there is nothing to back off to',
+    );
+  });
+
+  test('printTicket surfaces a connect failure without writing', () async {
+    final backend = FakePrinterBluetoothBackend(failConnect: true);
+    final manager = PrinterBluetoothManager(backend: backend);
+    manager.selectPrinter(PrinterBluetooth(_device('AA:11', 'Printer 1')));
+
+    addTearDown(() async {
+      await manager.dispose();
+      await backend.dispose();
+    });
+
+    await expectLater(
+      manager.printTicket(List<int>.filled(4, 1)),
+      throwsA(isA<Exception>()),
+      reason: 'a failed connect is reported to the caller',
+    );
+
+    expect(
+      backend.writeCount,
+      0,
+      reason: 'writeData must never run after a failed connect',
+    );
+    expect(
+      backend.disconnectCount,
+      greaterThanOrEqualTo(1),
+      reason: 'the socket is still released even though connect failed',
     );
   });
 }
