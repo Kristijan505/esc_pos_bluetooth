@@ -93,15 +93,10 @@ class _PrinterJobFailure implements Exception {
 /// Printer Bluetooth Manager
 class PrinterBluetoothManager {
   PrinterBluetoothManager({PrinterBluetoothBackend? backend})
-      : _backend = backend ??
-            BluetoothManagerBackend(BluetoothManager.instance);
+    : _backend = backend ?? BluetoothManagerBackend(BluetoothManager.instance);
 
   final PrinterBluetoothBackend _backend;
 
-  final List<Duration> _retryBackoffs = const <Duration>[
-    Duration(milliseconds: 500),
-    Duration(milliseconds: 1500),
-  ];
   final Duration _postSendSettleDelay = const Duration(seconds: 2);
 
   final BehaviorSubject<bool> _isScanning = BehaviorSubject.seeded(false);
@@ -297,36 +292,27 @@ class PrinterBluetoothManager {
   Future<PosPrintResult> _runPrintJob(_QueuedPrintJob job) async {
     await _stopScanInternal();
 
-    // Connect once, send the full payload once.
-    // The native layer (Android) already handles chunk sizing, retries,
-    // and reconnection internally.  Dart-level chunk/retry loops caused
-    // stale ACL_DISCONNECTED broadcasts to race against reconnects.
-    for (var attempt = 0; attempt < 3; attempt++) {
-      if (attempt > 0) {
-        await Future<void>.delayed(_retryBackoffs[attempt - 1]);
+    // Connect once, send the full payload once, and stop there.
+    //
+    // The retry loop that stood here re-sent the ticket from its first byte,
+    // but the printer had already put the beginning of the receipt on paper —
+    // so a broken connection produced a receipt with a repeated section
+    // instead of a clean failure.  A failed job now surfaces to the caller,
+    // and the user decides whether to print again.
+    try {
+      await _connectAndAwait(job.printer);
+      await _backend.writeData(job.bytes);
+
+      if (_postSendSettleDelay.inMilliseconds > 0) {
+        await Future<void>.delayed(_postSendSettleDelay);
       }
 
-      try {
-        await _connectAndAwait(job.printer);
-        await _backend.writeData(job.bytes);
-
-        if (_postSendSettleDelay.inMilliseconds > 0) {
-          await Future<void>.delayed(_postSendSettleDelay);
-        }
-
-        return PosPrintResult.success;
-      } on _PrinterJobFailure catch (failure) {
-        if (failure.result != PosPrintResult.timeout) {
-          return failure.result;
-        }
-      } catch (_) {
-        // Swallow and retry below.
-      } finally {
-        await _safeDisconnect();
-      }
+      return PosPrintResult.success;
+    } on _PrinterJobFailure catch (failure) {
+      return failure.result;
+    } finally {
+      await _safeDisconnect();
     }
-
-    return PosPrintResult.timeout;
   }
 
   Future<void> _connectAndAwait(PrinterBluetooth printer) async {

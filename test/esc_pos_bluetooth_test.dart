@@ -16,8 +16,9 @@ class FakePrinterBluetoothBackend implements PrinterBluetoothBackend {
   final BehaviorSubject<bool> _isScanning = BehaviorSubject<bool>.seeded(false);
   final BehaviorSubject<List<BluetoothDevice>> _scanResults =
       BehaviorSubject<List<BluetoothDevice>>.seeded(<BluetoothDevice>[]);
-  final BehaviorSubject<int?> _state =
-      BehaviorSubject<int?>.seeded(BluetoothManager.DISCONNECTED);
+  final BehaviorSubject<int?> _state = BehaviorSubject<int?>.seeded(
+    BluetoothManager.DISCONNECTED,
+  );
 
   final Set<int> failWritesOnChunkSizes;
   final int failWritesUntilConnectCount;
@@ -128,10 +129,10 @@ void main() {
     await Future<void>.delayed(Duration.zero);
 
     expect(emissions.isNotEmpty, isTrue);
-    expect(
-      emissions.last.map((printer) => printer.address).toList(),
-      <String>['AA:11', 'BB:22'],
-    );
+    expect(emissions.last.map((printer) => printer.address).toList(), <String>[
+      'AA:11',
+      'BB:22',
+    ]);
   });
 
   test('printTicket queues jobs serially', () async {
@@ -158,27 +159,26 @@ void main() {
     expect(await first, PosPrintResult.success);
     expect(await second, PosPrintResult.success);
 
-    expect(
-      backend.log,
-      <String>[
-        'stopScan',
-        'connect:AA:11',
-        'write:8',
-        'disconnect',
-        'stopScan',
-        'connect:AA:11',
-        'write:4',
-        'disconnect',
-      ],
-    );
+    expect(backend.log, <String>[
+      'stopScan',
+      'connect:AA:11',
+      'write:8',
+      'disconnect',
+      'stopScan',
+      'connect:AA:11',
+      'write:4',
+      'disconnect',
+    ]);
   });
 
-  // Dart-level chunk fallback was removed on purpose (see "Simplify BT print:
-  // remove _waitForState, send full payload at once"): the native layer already
-  // does chunk sizing and reconnection, and the Dart loop raced against stale
-  // ACL_DISCONNECTED broadcasts. A failing write now retries the WHOLE job.
-  test('printTicket resends the full payload instead of splitting it', () async {
-    final backend = FakePrinterBluetoothBackend(failWritesOnChunkSizes: <int>{300});
+  // Neither layer resends a ticket any more: the native side stopped
+  // restarting from byte 0 (which reprinted the part the printer had already
+  // put on paper), and this one stops after a single attempt.  A failed write
+  // reaches the caller, who asks the user whether to print again.
+  test('printTicket sends the payload once and never splits it', () async {
+    final backend = FakePrinterBluetoothBackend(
+      failWritesOnChunkSizes: <int>{300},
+    );
     final manager = PrinterBluetoothManager(backend: backend);
     manager.selectPrinter(PrinterBluetooth(_device('AA:11', 'Printer 1')));
 
@@ -187,22 +187,26 @@ void main() {
       await backend.dispose();
     });
 
-    final result = await manager.printTicket(List<int>.filled(300, 7));
-
-    expect(result, PosPrintResult.timeout);
-    expect(
-      backend.writeSizes,
-      <int>[300, 300, 300],
-      reason: 'full payload each time, never split into smaller chunks',
+    await expectLater(
+      manager.printTicket(List<int>.filled(300, 7)),
+      throwsA(isA<Exception>()),
+      reason: 'a failed write is reported, not swallowed by a retry',
     );
+
+    expect(backend.writeSizes, <int>[
+      300,
+    ], reason: 'full payload once, never split into smaller chunks');
+    expect(backend.connectCount, 1, reason: 'a single attempt');
     expect(
-      backend.connectCount,
-      3,
-      reason: 'three attempts, each with its own connect',
+      backend.disconnectCount,
+      greaterThanOrEqualTo(1),
+      reason: 'the socket is released even when the write fails',
     );
   });
 
-  test('printTicket retries the full job with backoff and succeeds on the third attempt', () async {
+  test('printTicket does not reconnect after a failed write', () async {
+    // Prije bi treci pokusaj uspio i ispis bi izasao dvaput; sada prvi
+    // neuspjeh zavrsava posao.
     final backend = FakePrinterBluetoothBackend(failWritesUntilConnectCount: 2);
     final manager = PrinterBluetoothManager(backend: backend);
     manager.selectPrinter(PrinterBluetooth(_device('AA:11', 'Printer 1')));
@@ -213,15 +217,18 @@ void main() {
     });
 
     final stopwatch = Stopwatch()..start();
-    final result = await manager.printTicket(List<int>.filled(1, 9));
+    await expectLater(
+      manager.printTicket(List<int>.filled(1, 9)),
+      throwsA(isA<Exception>()),
+    );
     stopwatch.stop();
 
-    expect(result, PosPrintResult.success);
-    expect(backend.connectCount, 3, reason: 'three attempts is the cap');
+    expect(backend.connectCount, 1, reason: 'no second attempt');
+    expect(backend.writeCount, 1);
     expect(
       stopwatch.elapsedMilliseconds,
-      greaterThanOrEqualTo(2000),
-      reason: 'backoffs of 500 ms and 1500 ms between the three attempts',
+      lessThan(2000),
+      reason: 'no backoff waits, because there is nothing to back off to',
     );
   });
 }
