@@ -37,6 +37,25 @@ abstract class PrinterBluetoothBackend {
   Future<void> connect(BluetoothDevice device);
   Future<void> disconnect();
   Future<void> writeData(List<int> bytes);
+
+  /// Sends [request] to the printer and returns its raw reply, or an empty
+  /// [Uint8List] if the printer stayed silent. See
+  /// [PrinterBluetoothManager.queryStatus] for the full contract.
+  ///
+  /// This has a default body - rather than being abstract - so that a
+  /// subclass which `extends` this class (instead of `implements`ing it)
+  /// keeps compiling without adding an override. It throws
+  /// [UnsupportedError] because a backend that predates status queries has
+  /// no way to actually perform one.
+  Future<Uint8List> queryStatus(
+    List<int> request, {
+    required Duration timeout,
+    required Duration grace,
+    required Duration quietPeriod,
+    required int maxBytes,
+  }) {
+    throw UnsupportedError('$runtimeType does not support queryStatus.');
+  }
 }
 
 class BluetoothManagerBackend implements PrinterBluetoothBackend {
@@ -68,21 +87,33 @@ class BluetoothManagerBackend implements PrinterBluetoothBackend {
 
   @override
   Future<void> writeData(List<int> bytes) => _manager.writeData(bytes);
+
+  @override
+  Future<Uint8List> queryStatus(
+    List<int> request, {
+    required Duration timeout,
+    required Duration grace,
+    required Duration quietPeriod,
+    required int maxBytes,
+  }) => _manager.queryStatus(
+    request,
+    timeout: timeout,
+    grace: grace,
+    quietPeriod: quietPeriod,
+    maxBytes: maxBytes,
+  );
 }
 
-class _QueuedPrintJob {
-  _QueuedPrintJob({
-    required this.printer,
-    required this.bytes,
-    required this.chunkSizeBytes,
-    required this.queueSleepTimeMs,
-  });
+/// A single job on [PrinterBluetoothManager]'s queue - either a print or a
+/// status query. `run` carries the job's own logic as a closure so the
+/// queue itself stays generic over what a job actually does and what it
+/// completes with.
+class _QueuedJob<T> {
+  _QueuedJob({required this.printer, required this.run});
 
   final PrinterBluetooth printer;
-  final List<int> bytes;
-  final int chunkSizeBytes;
-  final int queueSleepTimeMs;
-  final Completer<PosPrintResult> completer = Completer<PosPrintResult>();
+  final Future<T> Function() run;
+  final Completer<T> completer = Completer<T>();
 }
 
 /// Printer Bluetooth Manager
@@ -107,7 +138,7 @@ class PrinterBluetoothManager {
   StreamSubscription<bool>? _isScanningSubscription;
   bool _hasObservedScanningState = false;
 
-  final List<_QueuedPrintJob> _pendingJobs = <_QueuedPrintJob>[];
+  final List<_QueuedJob<dynamic>> _pendingJobs = <_QueuedJob<dynamic>>[];
   bool _isProcessingJobs = false;
   PrinterBluetooth? _selectedPrinter;
 
@@ -170,6 +201,60 @@ class PrinterBluetoothManager {
       chunkSizeBytes: chunkSizeBytes,
       queueSleepTimeMs: queueSleepTimeMs,
     );
+  }
+
+  /// Sends [request] to the selected printer's status query line and
+  /// returns its raw reply.
+  ///
+  /// An empty [Uint8List] result means the printer stayed silent within
+  /// [timeout] - that's a normal outcome (some queries, or some printers,
+  /// never answer), not an error.
+  ///
+  /// Like [printTicket], every call connects to the selected printer first
+  /// and disconnects again afterwards, and goes through the same job queue,
+  /// so a status query and a print job never share the wire at the same
+  /// time - whichever was requested first runs first.
+  ///
+  /// Unlike [printTicket], failures are not swallowed into a result value:
+  /// this is a new API with no external caller relying on a never-throws
+  /// contract, so a failed connect or backend error is rethrown to the
+  /// caller, and calling this without a previously [selectPrinter]-ed
+  /// printer throws a [StateError]. Invalid arguments ([timeout], [grace],
+  /// [quietPeriod], [maxBytes]) are validated by the backend and any
+  /// [ArgumentError] it raises reaches the caller unchanged.
+  ///
+  /// ESC/POS status replies carry no tag saying which request they answer,
+  /// so matching a reply to the request that produced it - by its fixed
+  /// bits - is the caller's responsibility.
+  Future<Uint8List> queryStatus(
+    List<int> request, {
+    Duration timeout = const Duration(milliseconds: 600),
+    Duration grace = const Duration(milliseconds: 50),
+    Duration quietPeriod = const Duration(milliseconds: 150),
+    int maxBytes = 16,
+  }) {
+    final printer = _selectedPrinter;
+    if (printer == null) {
+      throw StateError(
+        'No printer selected. Call selectPrinter() before queryStatus().',
+      );
+    }
+
+    final job = _QueuedJob<Uint8List>(
+      printer: printer,
+      run: () => _runQueryStatusJob(
+        printer,
+        request,
+        timeout: timeout,
+        grace: grace,
+        quietPeriod: quietPeriod,
+        maxBytes: maxBytes,
+      ),
+    );
+
+    _pendingJobs.add(job);
+    _scheduleQueueProcessing();
+    return job.completer.future;
   }
 
   Future<void> dispose() async {
@@ -264,11 +349,9 @@ class PrinterBluetoothManager {
       return Future<PosPrintResult>.value(PosPrintResult.printerNotSelected);
     }
 
-    final job = _QueuedPrintJob(
+    final job = _QueuedJob<PosPrintResult>(
       printer: printer,
-      bytes: List<int>.unmodifiable(bytes),
-      chunkSizeBytes: chunkSizeBytes,
-      queueSleepTimeMs: queueSleepTimeMs,
+      run: () => _runPrintJob(printer, List<int>.unmodifiable(bytes)),
     );
 
     _pendingJobs.add(job);
@@ -290,7 +373,7 @@ class PrinterBluetoothManager {
       while (_pendingJobs.isNotEmpty) {
         final job = _pendingJobs.removeAt(0);
         try {
-          final result = await _runPrintJob(job);
+          final result = await job.run();
           if (!job.completer.isCompleted) {
             job.completer.complete(result);
           }
@@ -305,7 +388,10 @@ class PrinterBluetoothManager {
     }
   }
 
-  Future<PosPrintResult> _runPrintJob(_QueuedPrintJob job) async {
+  Future<PosPrintResult> _runPrintJob(
+    PrinterBluetooth printer,
+    List<int> bytes,
+  ) async {
     await _stopScanInternal();
 
     lastError = null;
@@ -325,8 +411,8 @@ class PrinterBluetoothManager {
     // here would turn a broken Bluetooth link into an uncaught async error
     // for them.
     try {
-      await _connectAndAwait(job.printer);
-      await _backend.writeData(job.bytes);
+      await _connectAndAwait(printer);
+      await _backend.writeData(bytes);
 
       if (_postSendSettleDelay.inMilliseconds > 0) {
         await Future<void>.delayed(_postSendSettleDelay);
@@ -341,6 +427,36 @@ class PrinterBluetoothManager {
       }
 
       return PosPrintResult.timeout;
+    } finally {
+      await _safeDisconnect();
+    }
+  }
+
+  // Unlike _runPrintJob, this never swallows a failure into a result value:
+  // queryStatus is a new API with no external caller depending on a
+  // never-throws contract, so a failed connect or backend error is left to
+  // propagate to whoever is awaiting the job's completer. `lastError` is
+  // intentionally left untouched here - it documents print job failures
+  // only.
+  Future<Uint8List> _runQueryStatusJob(
+    PrinterBluetooth printer,
+    List<int> request, {
+    required Duration timeout,
+    required Duration grace,
+    required Duration quietPeriod,
+    required int maxBytes,
+  }) async {
+    await _stopScanInternal();
+
+    try {
+      await _connectAndAwait(printer);
+      return await _backend.queryStatus(
+        request,
+        timeout: timeout,
+        grace: grace,
+        quietPeriod: quietPeriod,
+        maxBytes: maxBytes,
+      );
     } finally {
       await _safeDisconnect();
     }
