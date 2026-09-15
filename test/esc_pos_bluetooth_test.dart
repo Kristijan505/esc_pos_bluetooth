@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:esc_pos_bluetooth/src/enums.dart';
 import 'package:esc_pos_bluetooth/src/printer_bluetooth_manager.dart';
@@ -12,6 +13,9 @@ class FakePrinterBluetoothBackend implements PrinterBluetoothBackend {
     this.failWritesUntilConnectCount = 0,
     this.failConnect = false,
     this.writeGate,
+    this.queryStatusResponse,
+    this.queryStatusError,
+    this.queryStatusGate,
   });
 
   final BehaviorSubject<bool> _isScanning = BehaviorSubject<bool>.seeded(false);
@@ -25,12 +29,21 @@ class FakePrinterBluetoothBackend implements PrinterBluetoothBackend {
   final int failWritesUntilConnectCount;
   final bool failConnect;
   final Completer<void>? writeGate;
+  final Uint8List? queryStatusResponse;
+  final Object? queryStatusError;
+  final Completer<void>? queryStatusGate;
 
   final List<String> log = <String>[];
   final List<int> writeSizes = <int>[];
+  // Snapshots of the actual bytes received (not just their length), so a
+  // test can tell whether a caller's later mutation of its own list leaked
+  // into what the backend saw.
+  final List<List<int>> receivedWrites = <List<int>>[];
+  final List<List<int>> receivedQueryRequests = <List<int>>[];
   int connectCount = 0;
   int disconnectCount = 0;
   int writeCount = 0;
+  int queryStatusCount = 0;
 
   @override
   Stream<bool> get isScanningStream => _isScanning.stream;
@@ -80,6 +93,7 @@ class FakePrinterBluetoothBackend implements PrinterBluetoothBackend {
   Future<void> writeData(List<int> bytes) async {
     writeCount++;
     writeSizes.add(bytes.length);
+    receivedWrites.add(List<int>.from(bytes));
     log.add('write:${bytes.length}');
 
     if (writeGate != null && !writeGate!.isCompleted) {
@@ -95,11 +109,65 @@ class FakePrinterBluetoothBackend implements PrinterBluetoothBackend {
     }
   }
 
+  @override
+  Future<Uint8List> queryStatus(
+    List<int> request, {
+    required Duration timeout,
+    required Duration grace,
+    required Duration quietPeriod,
+    required int maxBytes,
+  }) async {
+    queryStatusCount++;
+    receivedQueryRequests.add(List<int>.from(request));
+    log.add('queryStatus:${request.length}');
+
+    if (queryStatusGate != null && !queryStatusGate!.isCompleted) {
+      await queryStatusGate!.future;
+    }
+
+    if (queryStatusError != null) {
+      throw queryStatusError!;
+    }
+
+    return queryStatusResponse ?? Uint8List(0);
+  }
+
   Future<void> dispose() async {
     await _isScanning.close();
     await _scanResults.close();
     await _state.close();
   }
+}
+
+/// A backend that leaves [PrinterBluetoothBackend.queryStatus] unoverridden,
+/// to exercise its default `UnsupportedError` body. `extends` (rather than
+/// `implements`, as [FakePrinterBluetoothBackend] does) is what makes that
+/// default body apply here.
+class _MinimalBackend extends PrinterBluetoothBackend {
+  @override
+  Stream<bool> get isScanningStream => const Stream<bool>.empty();
+
+  @override
+  Stream<List<BluetoothDevice>> get scanResults =>
+      const Stream<List<BluetoothDevice>>.empty();
+
+  @override
+  Stream<int?> get state => const Stream<int?>.empty();
+
+  @override
+  Future<void> startScan(Duration timeout) async {}
+
+  @override
+  Future<void> stopScan() async {}
+
+  @override
+  Future<void> connect(BluetoothDevice device) async {}
+
+  @override
+  Future<void> disconnect() async {}
+
+  @override
+  Future<void> writeData(List<int> bytes) async {}
 }
 
 BluetoothDevice _device(String address, String name) {
@@ -278,4 +346,226 @@ void main() {
       reason: 'the socket is still released even though connect failed',
     );
   });
+
+  test('queryStatus returns bytes and connects/disconnects', () async {
+    final response = Uint8List.fromList(<int>[0x12, 0x34]);
+    final backend = FakePrinterBluetoothBackend(queryStatusResponse: response);
+    final manager = PrinterBluetoothManager(backend: backend);
+    manager.selectPrinter(PrinterBluetooth(_device('AA:11', 'Printer 1')));
+
+    addTearDown(() async {
+      await manager.dispose();
+      await backend.dispose();
+    });
+
+    final result = await manager.queryStatus(<int>[0x10, 0x04, 0x01]);
+
+    expect(result, response);
+    expect(backend.log, <String>[
+      'stopScan',
+      'connect:AA:11',
+      'queryStatus:3',
+      'disconnect',
+    ]);
+  });
+
+  test('queryStatus throws StateError without a selected printer', () async {
+    final backend = FakePrinterBluetoothBackend();
+    final manager = PrinterBluetoothManager(backend: backend);
+
+    addTearDown(() async {
+      await manager.dispose();
+      await backend.dispose();
+    });
+
+    // Passed as an already-created future (not a closure): queryStatus
+    // must return a failed future here rather than throw synchronously, so
+    // the error arrives the same way no matter how the caller awaits it.
+    expect(manager.queryStatus(<int>[0x10, 0x04, 0x01]), throwsStateError);
+  });
+
+  test(
+    'queryStatus propagates a backend error and still disconnects',
+    () async {
+      final backend = FakePrinterBluetoothBackend(
+        queryStatusError: Exception('forced query failure'),
+      );
+      final manager = PrinterBluetoothManager(backend: backend);
+      manager.selectPrinter(PrinterBluetooth(_device('AA:11', 'Printer 1')));
+
+      addTearDown(() async {
+        await manager.dispose();
+        await backend.dispose();
+      });
+
+      await expectLater(
+        manager.queryStatus(<int>[0x10, 0x04, 0x01]),
+        throwsA(isException),
+      );
+
+      expect(
+        backend.disconnectCount,
+        greaterThanOrEqualTo(1),
+        reason: 'the socket is released even when the query fails',
+      );
+    },
+  );
+
+  test(
+    'queryStatus sent while printing waits for the print job to finish',
+    () async {
+      final gate = Completer<void>();
+      final backend = FakePrinterBluetoothBackend(
+        writeGate: gate,
+        queryStatusResponse: Uint8List.fromList(<int>[0x00]),
+      );
+      final manager = PrinterBluetoothManager(backend: backend);
+      manager.selectPrinter(PrinterBluetooth(_device('AA:11', 'Printer 1')));
+
+      addTearDown(() async {
+        await manager.dispose();
+        await backend.dispose();
+      });
+
+      final printFuture = manager.printTicket(List<int>.filled(4, 1));
+      final statusFuture = manager.queryStatus(<int>[0x10, 0x04, 0x01]);
+
+      await Future<void>.delayed(const Duration(milliseconds: 25));
+
+      expect(
+        backend.queryStatusCount,
+        0,
+        reason: 'the print job holds the queue until the write gate opens',
+      );
+      expect(backend.connectCount, 1);
+
+      gate.complete();
+
+      expect(await printFuture, PosPrintResult.success);
+      expect(await statusFuture, Uint8List.fromList(<int>[0x00]));
+
+      expect(backend.log, <String>[
+        'stopScan',
+        'connect:AA:11',
+        'write:4',
+        'disconnect',
+        'stopScan',
+        'connect:AA:11',
+        'queryStatus:3',
+        'disconnect',
+      ]);
+    },
+  );
+
+  test('queryStatus returns an empty Uint8List for a silent printer', () async {
+    final backend = FakePrinterBluetoothBackend();
+    final manager = PrinterBluetoothManager(backend: backend);
+    manager.selectPrinter(PrinterBluetooth(_device('AA:11', 'Printer 1')));
+
+    addTearDown(() async {
+      await manager.dispose();
+      await backend.dispose();
+    });
+
+    final result = await manager.queryStatus(<int>[0x10, 0x04, 0x01]);
+
+    expect(result, isA<Uint8List>());
+    expect(result, isEmpty);
+  });
+
+  test('mutating the bytes list after printTicket() does not change what the '
+      'backend receives', () async {
+    final gate = Completer<void>();
+    final backend = FakePrinterBluetoothBackend(writeGate: gate);
+    final manager = PrinterBluetoothManager(backend: backend);
+    manager.selectPrinter(PrinterBluetooth(_device('AA:11', 'Printer 1')));
+
+    addTearDown(() async {
+      await manager.dispose();
+      await backend.dispose();
+    });
+
+    // A first job occupies the gate so the second job (whose bytes we're
+    // about to mutate) is still sitting in _pendingJobs, not yet running,
+    // when the mutation happens.
+    final blocker = manager.printTicket(List<int>.filled(1, 0xAA));
+
+    final bytes = List<int>.of(<int>[1, 2, 3]);
+    final second = manager.printTicket(bytes);
+
+    // Mutate the caller's own list after enqueuing but before the job runs.
+    bytes[0] = 0xFF;
+    bytes.add(4);
+
+    gate.complete();
+
+    expect(await blocker, PosPrintResult.success);
+    expect(await second, PosPrintResult.success);
+
+    expect(
+      backend.receivedWrites[1],
+      <int>[1, 2, 3],
+      reason:
+          'the job must have snapshotted the bytes when printTicket() was '
+          'called, not when it later ran',
+    );
+  });
+
+  test('mutating the request list after queryStatus() does not change what '
+      'the backend receives', () async {
+    final gate = Completer<void>();
+    final backend = FakePrinterBluetoothBackend(
+      writeGate: gate,
+      queryStatusResponse: Uint8List.fromList(<int>[0x00]),
+    );
+    final manager = PrinterBluetoothManager(backend: backend);
+    manager.selectPrinter(PrinterBluetooth(_device('AA:11', 'Printer 1')));
+
+    addTearDown(() async {
+      await manager.dispose();
+      await backend.dispose();
+    });
+
+    // printTicket occupies the gate so the queued queryStatus job (whose
+    // request we're about to mutate) is still waiting, not yet running.
+    final blocker = manager.printTicket(List<int>.filled(1, 0xAA));
+
+    final request = List<int>.of(<int>[0x10, 0x04, 0x01]);
+    final status = manager.queryStatus(request);
+
+    // Mutate the caller's own list after enqueuing but before the job runs.
+    request[0] = 0xFF;
+    request.add(0x99);
+
+    gate.complete();
+
+    expect(await blocker, PosPrintResult.success);
+    await status;
+
+    expect(
+      backend.receivedQueryRequests.single,
+      <int>[0x10, 0x04, 0x01],
+      reason:
+          'the job must have snapshotted the request when queryStatus() '
+          'was called, not when it later ran',
+    );
+  });
+
+  test(
+    'the default PrinterBluetoothBackend.queryStatus throws UnsupportedError',
+    () {
+      final backend = _MinimalBackend();
+
+      expect(
+        () => backend.queryStatus(
+          <int>[0x10, 0x04, 0x01],
+          timeout: const Duration(milliseconds: 600),
+          grace: const Duration(milliseconds: 50),
+          quietPeriod: const Duration(milliseconds: 150),
+          maxBytes: 16,
+        ),
+        throwsUnsupportedError,
+      );
+    },
+  );
 }
