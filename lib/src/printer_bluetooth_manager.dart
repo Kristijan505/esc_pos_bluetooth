@@ -219,9 +219,12 @@ class PrinterBluetoothManager {
   /// this is a new API with no external caller relying on a never-throws
   /// contract, so a failed connect or backend error is rethrown to the
   /// caller, and calling this without a previously [selectPrinter]-ed
-  /// printer throws a [StateError]. Invalid arguments ([timeout], [grace],
-  /// [quietPeriod], [maxBytes]) are validated by the backend and any
-  /// [ArgumentError] it raises reaches the caller unchanged.
+  /// printer completes the returned future with a [StateError] (never a
+  /// synchronous throw, so callers can rely on the error always arriving
+  /// through the future regardless of how they await it). Invalid
+  /// arguments ([timeout], [grace], [quietPeriod], [maxBytes]) are
+  /// validated by the backend and any [ArgumentError] it raises reaches
+  /// the caller unchanged.
   ///
   /// ESC/POS status replies carry no tag saying which request they answer,
   /// so matching a reply to the request that produced it - by its fixed
@@ -235,16 +238,29 @@ class PrinterBluetoothManager {
   }) {
     final printer = _selectedPrinter;
     if (printer == null) {
-      throw StateError(
-        'No printer selected. Call selectPrinter() before queryStatus().',
+      // Returned as a failed future rather than thrown synchronously, so
+      // the error always arrives through the future - the same way it
+      // would if the printer disappeared later in the queue - regardless
+      // of whether the caller awaits this call or merely holds onto it.
+      return Future<Uint8List>.error(
+        StateError(
+          'No printer selected. Call selectPrinter() before queryStatus().',
+        ),
       );
     }
+
+    // Snapshot now, not inside the closure: the closure only runs once this
+    // job reaches the front of the queue, which can be well after this call
+    // returns. Without this copy, a caller that mutates its list after
+    // calling queryStatus() (e.g. to reuse a buffer) would change what the
+    // backend actually receives.
+    final requestSnapshot = List<int>.unmodifiable(request);
 
     final job = _QueuedJob<Uint8List>(
       printer: printer,
       run: () => _runQueryStatusJob(
         printer,
-        request,
+        requestSnapshot,
         timeout: timeout,
         grace: grace,
         quietPeriod: quietPeriod,
@@ -349,9 +365,16 @@ class PrinterBluetoothManager {
       return Future<PosPrintResult>.value(PosPrintResult.printerNotSelected);
     }
 
+    // Snapshot now, not inside the closure: the closure only runs once this
+    // job reaches the front of the queue, which can be well after this call
+    // returns. Without this copy, a caller that mutates its list after
+    // calling printTicket()/writeBytes() (e.g. to reuse a buffer) would
+    // change what the backend actually receives.
+    final bytesSnapshot = List<int>.unmodifiable(bytes);
+
     final job = _QueuedJob<PosPrintResult>(
       printer: printer,
-      run: () => _runPrintJob(printer, List<int>.unmodifiable(bytes)),
+      run: () => _runPrintJob(printer, bytesSnapshot),
     );
 
     _pendingJobs.add(job);

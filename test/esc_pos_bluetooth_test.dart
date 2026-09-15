@@ -35,6 +35,11 @@ class FakePrinterBluetoothBackend implements PrinterBluetoothBackend {
 
   final List<String> log = <String>[];
   final List<int> writeSizes = <int>[];
+  // Snapshots of the actual bytes received (not just their length), so a
+  // test can tell whether a caller's later mutation of its own list leaked
+  // into what the backend saw.
+  final List<List<int>> receivedWrites = <List<int>>[];
+  final List<List<int>> receivedQueryRequests = <List<int>>[];
   int connectCount = 0;
   int disconnectCount = 0;
   int writeCount = 0;
@@ -88,6 +93,7 @@ class FakePrinterBluetoothBackend implements PrinterBluetoothBackend {
   Future<void> writeData(List<int> bytes) async {
     writeCount++;
     writeSizes.add(bytes.length);
+    receivedWrites.add(List<int>.from(bytes));
     log.add('write:${bytes.length}');
 
     if (writeGate != null && !writeGate!.isCompleted) {
@@ -112,6 +118,7 @@ class FakePrinterBluetoothBackend implements PrinterBluetoothBackend {
     required int maxBytes,
   }) async {
     queryStatusCount++;
+    receivedQueryRequests.add(List<int>.from(request));
     log.add('queryStatus:${request.length}');
 
     if (queryStatusGate != null && !queryStatusGate!.isCompleted) {
@@ -371,10 +378,10 @@ void main() {
       await backend.dispose();
     });
 
-    expect(
-      () => manager.queryStatus(<int>[0x10, 0x04, 0x01]),
-      throwsStateError,
-    );
+    // Passed as an already-created future (not a closure): queryStatus
+    // must return a failed future here rather than throw synchronously, so
+    // the error arrives the same way no matter how the caller awaits it.
+    expect(manager.queryStatus(<int>[0x10, 0x04, 0x01]), throwsStateError);
   });
 
   test(
@@ -464,6 +471,84 @@ void main() {
 
     expect(result, isA<Uint8List>());
     expect(result, isEmpty);
+  });
+
+  test('mutating the bytes list after printTicket() does not change what the '
+      'backend receives', () async {
+    final gate = Completer<void>();
+    final backend = FakePrinterBluetoothBackend(writeGate: gate);
+    final manager = PrinterBluetoothManager(backend: backend);
+    manager.selectPrinter(PrinterBluetooth(_device('AA:11', 'Printer 1')));
+
+    addTearDown(() async {
+      await manager.dispose();
+      await backend.dispose();
+    });
+
+    // A first job occupies the gate so the second job (whose bytes we're
+    // about to mutate) is still sitting in _pendingJobs, not yet running,
+    // when the mutation happens.
+    final blocker = manager.printTicket(List<int>.filled(1, 0xAA));
+
+    final bytes = List<int>.of(<int>[1, 2, 3]);
+    final second = manager.printTicket(bytes);
+
+    // Mutate the caller's own list after enqueuing but before the job runs.
+    bytes[0] = 0xFF;
+    bytes.add(4);
+
+    gate.complete();
+
+    expect(await blocker, PosPrintResult.success);
+    expect(await second, PosPrintResult.success);
+
+    expect(
+      backend.receivedWrites[1],
+      <int>[1, 2, 3],
+      reason:
+          'the job must have snapshotted the bytes when printTicket() was '
+          'called, not when it later ran',
+    );
+  });
+
+  test('mutating the request list after queryStatus() does not change what '
+      'the backend receives', () async {
+    final gate = Completer<void>();
+    final backend = FakePrinterBluetoothBackend(
+      writeGate: gate,
+      queryStatusResponse: Uint8List.fromList(<int>[0x00]),
+    );
+    final manager = PrinterBluetoothManager(backend: backend);
+    manager.selectPrinter(PrinterBluetooth(_device('AA:11', 'Printer 1')));
+
+    addTearDown(() async {
+      await manager.dispose();
+      await backend.dispose();
+    });
+
+    // printTicket occupies the gate so the queued queryStatus job (whose
+    // request we're about to mutate) is still waiting, not yet running.
+    final blocker = manager.printTicket(List<int>.filled(1, 0xAA));
+
+    final request = List<int>.of(<int>[0x10, 0x04, 0x01]);
+    final status = manager.queryStatus(request);
+
+    // Mutate the caller's own list after enqueuing but before the job runs.
+    request[0] = 0xFF;
+    request.add(0x99);
+
+    gate.complete();
+
+    expect(await blocker, PosPrintResult.success);
+    await status;
+
+    expect(
+      backend.receivedQueryRequests.single,
+      <int>[0x10, 0x04, 0x01],
+      reason:
+          'the job must have snapshotted the request when queryStatus() '
+          'was called, not when it later ran',
+    );
   });
 
   test(
