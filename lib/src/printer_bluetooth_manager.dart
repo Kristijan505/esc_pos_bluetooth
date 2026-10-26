@@ -151,6 +151,11 @@ class PrinterBluetoothManager {
   /// `job_timeout` from the native side matters when tracking down a
   /// printer issue. Cleared at the start of every job, set right before a
   /// failed job's result is returned.
+  ///
+  /// Describes the most recent job that actually ran; calls that return
+  /// early without running a job (`ticketEmpty`, `printerNotSelected`) leave
+  /// it as it was. Meaningful only right after a `printTicket`/`writeBytes`
+  /// call that returned `PosPrintResult.timeout`.
   String? lastError;
 
   /// Where the most recent print job failed, or `null` after a job that
@@ -162,6 +167,10 @@ class PrinterBluetoothManager {
   /// sent) from [PosPrintFailureStage.write] (part of the ticket may already
   /// be on paper). Cleared together with [lastError] at the start of every
   /// print job; [queryStatus] never touches it.
+  ///
+  /// Like [lastError], it describes the most recent job that actually ran
+  /// and is meaningful only right after a `printTicket`/`writeBytes` call
+  /// that returned `PosPrintResult.timeout`.
   PosPrintFailureStage? lastErrorStage;
 
   void startScan(Duration timeout) {
@@ -426,10 +435,10 @@ class PrinterBluetoothManager {
     PrinterBluetooth printer,
     List<int> bytes,
   ) async {
-    await _stopScanInternal();
-
     lastError = null;
     lastErrorStage = null;
+
+    await _stopScanInternal();
 
     // Connect once, send the full payload once, and stop there.
     //
@@ -505,9 +514,9 @@ class PrinterBluetoothManager {
   Future<void> _connectAndAwait(PrinterBluetooth printer) async {
     // Native connect() completes only once the link is usable on both
     // platforms (Android: RFCOMM socket connected; iOS: peripheral connected
-    // and a writable characteristic found - flutter_bluetooth_basic branch
-    // fix/ios-connect-ceka-vezu; before it iOS completed immediately and
-    // every iOS print failed). No need to poll the state stream afterwards.
+    // and a writable characteristic found - flutter_bluetooth_basic fix of
+    // Oct 2026; before it iOS completed connect immediately and every iOS
+    // print failed). No need to poll the state stream afterwards.
     await _backend.connect(printer._device);
   }
 
