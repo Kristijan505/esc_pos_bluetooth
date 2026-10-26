@@ -151,7 +151,27 @@ class PrinterBluetoothManager {
   /// `job_timeout` from the native side matters when tracking down a
   /// printer issue. Cleared at the start of every job, set right before a
   /// failed job's result is returned.
+  ///
+  /// Describes the most recent job that actually ran; calls that return
+  /// early without running a job (`ticketEmpty`, `printerNotSelected`) leave
+  /// it as it was. Meaningful only right after a `printTicket`/`writeBytes`
+  /// call that returned `PosPrintResult.timeout`.
   String? lastError;
+
+  /// Where the most recent print job failed, or `null` after a job that
+  /// never failed (or hasn't run yet).
+  ///
+  /// Side channel next to [lastError], for the same reason: `printTicket`/
+  /// `writeBytes` return a `PosPrintResult` and never throw, so this is the
+  /// only way a caller can tell [PosPrintFailureStage.connect] (nothing was
+  /// sent) from [PosPrintFailureStage.write] (part of the ticket may already
+  /// be on paper). Cleared together with [lastError] at the start of every
+  /// print job; [queryStatus] never touches it.
+  ///
+  /// Like [lastError], it describes the most recent job that actually ran
+  /// and is meaningful only right after a `printTicket`/`writeBytes` call
+  /// that returned `PosPrintResult.timeout`.
+  PosPrintFailureStage? lastErrorStage;
 
   void startScan(Duration timeout) {
     unawaited(_restartScan(timeout));
@@ -405,6 +425,15 @@ class PrinterBluetoothManager {
             job.completer.completeError(error, stackTrace);
           }
         }
+
+        // Completing the completer only schedules the caller's continuation
+        // as a microtask. Starting the next job right away would clear
+        // lastError/lastErrorStage before that caller could read them, so
+        // let a timer turn pass (all microtasks run first) when more work
+        // is queued. Jobs added meanwhile are picked up by this same loop.
+        if (_pendingJobs.isNotEmpty) {
+          await Future<void>.delayed(Duration.zero);
+        }
       }
     } finally {
       _isProcessingJobs = false;
@@ -415,9 +444,10 @@ class PrinterBluetoothManager {
     PrinterBluetooth printer,
     List<int> bytes,
   ) async {
-    await _stopScanInternal();
-
     lastError = null;
+    lastErrorStage = null;
+
+    await _stopScanInternal();
 
     // Connect once, send the full payload once, and stop there.
     //
@@ -433,8 +463,10 @@ class PrinterBluetoothManager {
     // do `final res = await printTicket(...)` without a try/catch. Throwing
     // here would turn a broken Bluetooth link into an uncaught async error
     // for them.
+    var connected = false;
     try {
       await _connectAndAwait(printer);
+      connected = true;
       await _backend.writeData(bytes);
 
       if (_postSendSettleDelay.inMilliseconds > 0) {
@@ -444,6 +476,9 @@ class PrinterBluetoothManager {
       return PosPrintResult.success;
     } catch (error) {
       lastError = error.toString();
+      lastErrorStage = connected
+          ? PosPrintFailureStage.write
+          : PosPrintFailureStage.connect;
 
       if (kDebugMode) {
         debugPrint('esc_pos_bluetooth: print job failed: $lastError');
@@ -486,10 +521,11 @@ class PrinterBluetoothManager {
   }
 
   Future<void> _connectAndAwait(PrinterBluetooth printer) async {
-    // Native connect() is blocking on both platforms:
-    //  - Android: socket.connect() blocks until RFCOMM is up
-    //  - iOS: CoreBluetooth connect waits for didConnect + service discovery
-    // No need to poll the state stream afterwards.
+    // Native connect() completes only once the link is usable on both
+    // platforms (Android: RFCOMM socket connected; iOS: peripheral connected
+    // and a writable characteristic found - flutter_bluetooth_basic fix of
+    // Oct 2026; before it iOS completed connect immediately and every iOS
+    // print failed). No need to poll the state stream afterwards.
     await _backend.connect(printer._device);
   }
 
