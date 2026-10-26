@@ -425,6 +425,15 @@ class PrinterBluetoothManager {
             job.completer.completeError(error, stackTrace);
           }
         }
+
+        // Completing the completer only schedules the caller's continuation
+        // as a microtask. Starting the next job right away would clear
+        // lastError/lastErrorStage before that caller could read them, so
+        // let a timer turn pass (all microtasks run first) when more work
+        // is queued. Jobs added meanwhile are picked up by this same loop.
+        if (_pendingJobs.isNotEmpty) {
+          await Future<void>.delayed(Duration.zero);
+        }
       }
     } finally {
       _isProcessingJobs = false;

@@ -436,6 +436,34 @@ void main() {
     },
   );
 
+  test(
+    'a queued job does not clear the diagnostics of the job before it',
+    () async {
+      // Job A (connectCount 1) fails its write, job B (connectCount 2) succeeds.
+      final backend = FakePrinterBluetoothBackend(
+        failWritesUntilConnectCount: 1,
+      );
+      final manager = PrinterBluetoothManager(backend: backend);
+      manager.selectPrinter(PrinterBluetooth(_device('AA:11', 'Printer 1')));
+
+      addTearDown(() async {
+        await manager.dispose();
+        await backend.dispose();
+      });
+
+      final a = manager.printTicket(List<int>.filled(4, 1));
+      final b = manager.printTicket(List<int>.filled(4, 2));
+
+      expect(await a, PosPrintResult.timeout);
+      expect(manager.lastError, contains('forced write failure'));
+      expect(manager.lastErrorStage, PosPrintFailureStage.write);
+
+      expect(await b, PosPrintResult.success);
+      expect(manager.lastError, isNull);
+      expect(manager.lastErrorStage, isNull);
+    },
+  );
+
   test('queryStatus returns bytes and connects/disconnects', () async {
     final response = Uint8List.fromList(<int>[0x12, 0x34]);
     final backend = FakePrinterBluetoothBackend(queryStatusResponse: response);
