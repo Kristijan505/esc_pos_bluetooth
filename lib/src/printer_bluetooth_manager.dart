@@ -153,6 +153,17 @@ class PrinterBluetoothManager {
   /// failed job's result is returned.
   String? lastError;
 
+  /// Where the most recent print job failed, or `null` after a job that
+  /// never failed (or hasn't run yet).
+  ///
+  /// Side channel next to [lastError], for the same reason: `printTicket`/
+  /// `writeBytes` return a `PosPrintResult` and never throw, so this is the
+  /// only way a caller can tell [PosPrintFailureStage.connect] (nothing was
+  /// sent) from [PosPrintFailureStage.write] (part of the ticket may already
+  /// be on paper). Cleared together with [lastError] at the start of every
+  /// print job; [queryStatus] never touches it.
+  PosPrintFailureStage? lastErrorStage;
+
   void startScan(Duration timeout) {
     unawaited(_restartScan(timeout));
   }
@@ -418,6 +429,7 @@ class PrinterBluetoothManager {
     await _stopScanInternal();
 
     lastError = null;
+    lastErrorStage = null;
 
     // Connect once, send the full payload once, and stop there.
     //
@@ -433,8 +445,10 @@ class PrinterBluetoothManager {
     // do `final res = await printTicket(...)` without a try/catch. Throwing
     // here would turn a broken Bluetooth link into an uncaught async error
     // for them.
+    var connected = false;
     try {
       await _connectAndAwait(printer);
+      connected = true;
       await _backend.writeData(bytes);
 
       if (_postSendSettleDelay.inMilliseconds > 0) {
@@ -444,6 +458,9 @@ class PrinterBluetoothManager {
       return PosPrintResult.success;
     } catch (error) {
       lastError = error.toString();
+      lastErrorStage = connected
+          ? PosPrintFailureStage.write
+          : PosPrintFailureStage.connect;
 
       if (kDebugMode) {
         debugPrint('esc_pos_bluetooth: print job failed: $lastError');
@@ -486,10 +503,11 @@ class PrinterBluetoothManager {
   }
 
   Future<void> _connectAndAwait(PrinterBluetooth printer) async {
-    // Native connect() is blocking on both platforms:
-    //  - Android: socket.connect() blocks until RFCOMM is up
-    //  - iOS: CoreBluetooth connect waits for didConnect + service discovery
-    // No need to poll the state stream afterwards.
+    // Native connect() completes only once the link is usable on both
+    // platforms (Android: RFCOMM socket connected; iOS: peripheral connected
+    // and a writable characteristic found - flutter_bluetooth_basic branch
+    // fix/ios-connect-ceka-vezu; before it iOS completed immediately and
+    // every iOS print failed). No need to poll the state stream afterwards.
     await _backend.connect(printer._device);
   }
 

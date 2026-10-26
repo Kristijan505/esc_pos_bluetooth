@@ -34,3 +34,14 @@ class PosPrintResult {
     }
   }
 }
+
+/// Where a failed print job went wrong. See
+/// `PrinterBluetoothManager.lastErrorStage`.
+enum PosPrintFailureStage {
+  /// The job failed while connecting, before any byte of it was sent.
+  connect,
+
+  /// The connection was up and sending had started, so part of the ticket
+  /// may already be on paper.
+  write,
+}

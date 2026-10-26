@@ -334,6 +334,7 @@ void main() {
       reason: 'a failed connect is reported as a returned result to the caller',
     );
     expect(manager.lastError, contains('forced connect failure'));
+    expect(manager.lastErrorStage, PosPrintFailureStage.connect);
 
     expect(
       backend.writeCount,
@@ -346,6 +347,94 @@ void main() {
       reason: 'the socket is still released even though connect failed',
     );
   });
+
+  test('printTicket reports a failed write as the write stage', () async {
+    final backend = FakePrinterBluetoothBackend(failWritesUntilConnectCount: 1);
+    final manager = PrinterBluetoothManager(backend: backend);
+    manager.selectPrinter(PrinterBluetooth(_device('AA:11', 'Printer 1')));
+
+    addTearDown(() async {
+      await manager.dispose();
+      await backend.dispose();
+    });
+
+    final result = await manager.printTicket(List<int>.filled(4, 1));
+
+    expect(result, PosPrintResult.timeout);
+    expect(manager.lastError, isNotNull);
+    expect(manager.lastErrorStage, PosPrintFailureStage.write);
+  });
+
+  test('a successful job leaves lastError and lastErrorStage null', () async {
+    final backend = FakePrinterBluetoothBackend();
+    final manager = PrinterBluetoothManager(backend: backend);
+    manager.selectPrinter(PrinterBluetooth(_device('AA:11', 'Printer 1')));
+
+    addTearDown(() async {
+      await manager.dispose();
+      await backend.dispose();
+    });
+
+    final result = await manager.printTicket(List<int>.filled(4, 1));
+
+    expect(result, PosPrintResult.success);
+    expect(manager.lastError, isNull);
+    expect(manager.lastErrorStage, isNull);
+  });
+
+  test('a successful job after a failed one clears lastErrorStage', () async {
+    // The first job (connectCount 1) fails its write, the second succeeds.
+    final backend = FakePrinterBluetoothBackend(failWritesUntilConnectCount: 1);
+    final manager = PrinterBluetoothManager(backend: backend);
+    manager.selectPrinter(PrinterBluetooth(_device('AA:11', 'Printer 1')));
+
+    addTearDown(() async {
+      await manager.dispose();
+      await backend.dispose();
+    });
+
+    expect(
+      await manager.printTicket(List<int>.filled(4, 1)),
+      PosPrintResult.timeout,
+    );
+    expect(manager.lastErrorStage, PosPrintFailureStage.write);
+
+    expect(
+      await manager.printTicket(List<int>.filled(4, 1)),
+      PosPrintResult.success,
+    );
+    expect(manager.lastError, isNull);
+    expect(manager.lastErrorStage, isNull);
+  });
+
+  test(
+    'queryStatus failure leaves lastError and lastErrorStage alone',
+    () async {
+      final backend = FakePrinterBluetoothBackend(
+        failWritesUntilConnectCount: 1,
+        queryStatusError: Exception('forced query failure'),
+      );
+      final manager = PrinterBluetoothManager(backend: backend);
+      manager.selectPrinter(PrinterBluetooth(_device('AA:11', 'Printer 1')));
+
+      addTearDown(() async {
+        await manager.dispose();
+        await backend.dispose();
+      });
+
+      await manager.printTicket(List<int>.filled(4, 1));
+      final errorBefore = manager.lastError;
+      expect(manager.lastErrorStage, PosPrintFailureStage.write);
+
+      await expectLater(
+        manager.queryStatus(<int>[0x10, 0x04, 0x01]),
+        throwsA(isException),
+      );
+
+      expect(manager.lastErrorStage, PosPrintFailureStage.write);
+      expect(manager.lastError, errorBefore);
+    },
+  );
 
   test('queryStatus returns bytes and connects/disconnects', () async {
     final response = Uint8List.fromList(<int>[0x12, 0x34]);
